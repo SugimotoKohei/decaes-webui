@@ -1,0 +1,15 @@
+# Gitと仮想環境など監視不要なものを除外
+.git
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.zip
+data
+datasets
+cache
+tmp

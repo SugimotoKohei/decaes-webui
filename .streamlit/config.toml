@@ -1,0 +1,13 @@
+[server]
+# Cloud環境のinotify制限を回避（ホットリロードはポーリング方式に）
+fileWatcherType = "poll"
+enableCORS = false
+enableXsrfProtection = true
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[logger]
+level = "info"
