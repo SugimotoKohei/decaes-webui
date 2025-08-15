@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-DECAES.jl Runner (Streamlit, DICOM/NIfTI/CSV→NIfTI, CSV[gzip]出力, 改善版)
+DECAES.jl Runner (Streamlit, DICOM/NIfTI/CSV→NIfTI, CSV[gzip]出力, 改善版 + サンプルデータ内蔵)
 - 入力:
   A) DICOM（1枚以上）→ dcm2niix で NIfTI へ変換
   B) 既存 NIfTI（.nii/.nii.gz）
   C) CSV（1列目=TE[ms], 2列目=Signal）→ 1x1x1xN の4D NIfTIに変換
+  D) **サンプルデータ（CSV/NIfTI）を内蔵生成して即実行**
 - 改善点（抜粋）:
   * 一時ディレクトリの確実な掃除（TemporaryDirectory）
   * julia / dcm2niix の存在チェック
@@ -15,9 +16,10 @@ DECAES.jl Runner (Streamlit, DICOM/NIfTI/CSV→NIfTI, CSV[gzip]出力, 改善版
   * TE推定の根拠（候補/差分中央値/CSV近似誤差）の可視化
   * Julia Pkg.precompile + 任意タイムアウト
   * ライセンス告知強化（DECAES=MIT, dcm2niix=BSD-2-Clause）
+  * **サンプルCSV/NIfTIジェネレータ**と「今すぐ試す」UI
 """
 
-import os, json, shlex, tempfile, shutil, zipfile, io, re, subprocess, math
+import os, json, shlex, tempfile, shutil, zipfile, io, re, subprocess
 from tempfile import TemporaryDirectory, mkstemp
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
@@ -27,10 +29,49 @@ import numpy as np
 import pandas as pd
 import h5py
 from scipy.io import loadmat as scipy_loadmat
-import nibabel as nib  # ← 追加（CSV→NIfTI用）
+import nibabel as nib  # CSV/NIfTI生成・読込
+
+# ====== Julia ローカルインストーラ（Streamlit Cloud向け：Julia 1.10.5を取得） ======
+@st.cache_resource(show_spinner=False)
+def get_local_julia_bin() -> str:
+    """
+    Streamlit Cloudの古いapt版Juliaを回避し、公式バイナリ(Julia 1.10.5)をユーザ領域へ展開して使用。
+    既に展開済みならそれを流用。
+    戻り値: julia実行ファイルのフルパス
+    """
+    import sys, tarfile, urllib.request, os
+    base = Path.home() / ".local" / "julia-1.10.5"
+    binp = base / "julia-1.10.5" / "bin" / "julia"
+    if binp.exists():
+        return str(binp)
+    base.mkdir(parents=True, exist_ok=True)
+    url = "https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-1.10.5-linux-x86_64.tar.gz"
+    tar_gz = base / "julia-1.10.5-linux-x86_64.tar.gz"
+    with urllib.request.urlopen(url) as r, open(tar_gz, "wb") as f:
+        f.write(r.read())
+    with tarfile.open(tar_gz, "r:gz") as tf:
+        tf.extractall(path=base)
+    return str(binp)
+
+def julia_bin() -> str:
+    # まず環境変数JULIA_BINがあればそれを優先
+    jb = os.environ.get("JULIA_BIN", "").strip()
+    if jb and Path(jb).exists():
+        return jb
+    # ローカルJuliaを取得（キャッシュ）
+    try:
+        return get_local_julia_bin()
+    except Exception as e:
+        # フォールバック: PATH上のjulia（ある場合）
+        import shutil as _sh
+        p = _sh.which("julia")
+        if p:
+            return p
+        raise RuntimeError(f"Juliaの用意に失敗しました: {e}")
+
 
 # ====== 定数 / 設定 ======
-JULIA = "julia"
+JULIA = None  # resolved dynamically by julia_bin()
 DCM2NIIX = "dcm2niix"
 
 APP_SOURCE_URL = os.environ.get("APP_SOURCE_URL", "")  # このアプリのソースURL（任意）
@@ -55,7 +96,7 @@ def assert_cli_available():
     """julia / dcm2niix が PATH にあるかを確認"""
     import shutil as _shutil
     missing = []
-    for exe in (JULIA, DCM2NIIX):
+    for exe in (DCM2NIIX,):
         if _shutil.which(exe) is None:
             missing.append(exe)
     if missing:
@@ -122,7 +163,7 @@ def ensure_decaes() -> None:
         'Pkg.precompile(); '
         'using DECAES; println("DECAES loaded OK");'
     )
-    rc, out, err = _run([JULIA, "--project=@decaes", "-e", jl])
+    rc, out, err = _run([julia_bin(), "--project=@decaes", "-e", jl])
     if rc != 0:
         raise RuntimeError(f"DECAES インストール失敗\n--- STDOUT ---\n{out}\n--- STDERR ---\n{err}")
 
@@ -161,10 +202,6 @@ def dcm2niix_convert(dicom_files: List[Path]) -> List[Dict[str, Any]]:
 
 # ====== BIDS JSON → TE推定 ======
 def parse_te_from_json_verbose(json_path: Path) -> Tuple[Optional[float], Dict[str, Any]]:
-    """
-    BIDS JSONを読み、EchoTimes (秒) または EchoTimeX 群から inter-echo 間隔を推定。
-    戻り値: (採用TE[秒] or None, {"candidates": [...秒], "diffs": [...秒], "median_diff": 秒 or None})
-    """
     info = {"candidates": [], "diffs": [], "median_diff": None}
     try:
         with open(json_path, "r") as f:
@@ -203,17 +240,9 @@ def parse_te_from_json_verbose(json_path: Path) -> Tuple[Optional[float], Dict[s
 
 # ====== CSV → 4D NIfTI 変換 ======
 def csv_to_nifti(csv_file: Path) -> Tuple[Path, Optional[float], Dict[str, Any]]:
-    """
-    CSV(TE[ms], Signal)を読み、(1,1,1,N) の NIfTI に変換。
-    戻り値: (nifti_path, te_sec (近似; None可), info_dict)
-      info_dict: {"nTE": N, "te_ms_list": [...], "interval_ms_median": x, "interval_ms_max_err": y}
-    ※ TEが厳密等間隔でない場合、中央値差分を採用し、最大誤差を返す。
-    """
-    # pandasで柔軟に読み取り（カンマ/タブ/スペース対応）
     try:
         df = pd.read_csv(csv_file, header=None)
     except Exception:
-        # セミコロン/タブなどの可能性
         try:
             df = pd.read_csv(csv_file, header=None, sep=None, engine="python")
         except Exception as e:
@@ -231,7 +260,6 @@ def csv_to_nifti(csv_file: Path) -> Tuple[Path, Optional[float], Dict[str, Any]]
     if te_ms.ndim != 1 or sig.ndim != 1 or te_ms.size != sig.size or te_ms.size < 2:
         raise ValueError("CSVの行数が不正です（2行以上、列数一致が必要）。")
 
-    # TE等間隔チェック（中央値差分を採用）
     te_sorted_idx = np.argsort(te_ms)
     te_ms = te_ms[te_sorted_idx]
     sig = sig[te_sorted_idx]
@@ -246,15 +274,64 @@ def csv_to_nifti(csv_file: Path) -> Tuple[Path, Optional[float], Dict[str, Any]]
         "interval_ms_max_err": max_err,
     }
 
-    # 4D NIfTIへ（形状: 1x1x1xN）
     arr = sig.astype(np.float32).reshape((1, 1, 1, -1))
     img = nib.Nifti1Image(arr, affine=np.eye(4))
     fd, fp = mkstemp(suffix=".nii.gz"); os.close(fd)
     nib.save(img, fp)
 
-    # TE（秒）を返す（中央値差分を近似値として）
     te_sec = med / 1000.0 if med > 0 else None
     return Path(fp), te_sec, info
+
+
+# ====== サンプルデータ生成 ======
+def synth_decay(TE_ms: np.ndarray, comps: List[tuple], noise_std: float = 0.0) -> np.ndarray:
+    """
+    単/多成分指数減衰を合成。comps = [(amp, T2_ms), ...]
+    """
+    TE_s = TE_ms / 1000.0
+    sig = np.zeros_like(TE_s, dtype=float)
+    for amp, t2ms in comps:
+        sig += amp * np.exp(-TE_s / (t2ms / 1000.0))
+    if noise_std > 0:
+        sig += np.random.normal(0, noise_std, size=sig.shape)
+    return sig
+
+def make_sample_csv(nTE=32, TE0_ms=10.0, dTE_ms=10.0, mode="bi", noise=0.0) -> bytes:
+    """
+    サンプルCSVを生成。mode="mono" or "bi"
+    """
+    TE_ms = TE0_ms + dTE_ms * np.arange(nTE)
+    if mode == "mono":
+        sig = synth_decay(TE_ms, [(1000.0, 80.0)], noise_std=noise)
+    else:
+        sig = synth_decay(TE_ms, [(700.0, 20.0), (300.0, 80.0)], noise_std=noise)
+    df = pd.DataFrame({"TE_ms": np.round(TE_ms, 6), "Signal": np.round(sig, 6)})
+    bio = io.BytesIO()
+    df.to_csv(bio, index=False, header=False)
+    return bio.getvalue()
+
+def make_sample_nifti(nTE=32, TE0_ms=10.0, dTE_ms=10.0, noise=0.0) -> Tuple[bytes, Optional[float]]:
+    """
+    小さな(4x4x1xN) 4D NIfTIを生成。各ボクセルで成分比を変える。
+    """
+    TE_ms = TE0_ms + dTE_ms * np.arange(nTE)
+    te_sec = dTE_ms / 1000.0
+    arr = np.zeros((4,4,1,nTE), dtype=np.float32)
+    # 4つの代表コンボを敷き詰め
+    combos = [
+        [(1.0, 20.0), (0.0, 80.0)],   # shortのみ
+        [(0.5, 20.0), (0.5, 80.0)],   # half-half
+        [(0.2, 20.0), (0.8, 80.0)],   # long優位
+        [(0.0, 20.0), (1.0, 80.0)],   # longのみ
+    ]
+    for i in range(4):
+        for j in range(4):
+            mix = combos[(i*4 + j) % len(combos)]
+            amps = [(1000.0*mix[0][0], mix[0][1]), (1000.0*mix[1][0], mix[1][1])]
+            arr[i,j,0,:] = synth_decay(TE_ms, amps, noise_std=noise).astype(np.float32)
+    img = nib.Nifti1Image(arr, affine=np.eye(4))
+    bio = io.BytesIO(); nib.save(img, bio)
+    return bio.getvalue(), te_sec
 
 
 # ====== .mat → CSV(gzip) ======
@@ -428,7 +505,7 @@ def build_decaes_args(
     return args
 
 def execute_decaes(args: List[str], out_dir: Path, timeout_sec: int) -> Tuple[bytes, str]:
-    cmd = [JULIA, "--project=@decaes", "--threads=auto", "--compile=min", "-e", "using DECAES; main()", "--"] + args
+    cmd = [julia_bin(), "--project=@decaes", "--threads=auto", "--compile=min", "-e", "using DECAES; main()", "--"] + args
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     stdout, stderr = proc.stdout, proc.stderr
     (out_dir / "decaes_log.txt").write_text(stdout + ("\n\n[STDERR]\n" + stderr if stderr.strip() else ""), encoding="utf-8")
@@ -446,13 +523,13 @@ def execute_decaes(args: List[str], out_dir: Path, timeout_sec: int) -> Tuple[by
 
 
 # ====== UI ======
-st.set_page_config(page_title="DECAES.jl Runner（改良版：CSV対応）", layout="wide")
-st.title("DECAES.jl 実行UI（DICOM/NIfTI/CSV対応・任意パラメータ・CSV[gzip]・堅牢化）")
+st.set_page_config(page_title="DECAES.jl Runner（改良版：CSV/サンプル対応）", layout="wide")
+st.title("DECAES.jl 実行UI（DICOM/NIfTI/CSV/サンプル対応・任意パラメータ・CSV[gzip]・堅牢化）")
 
 with st.expander("利用上の注意 / ライセンス", expanded=True):
     st.markdown(
         f"""
-- **入力**: DICOM（1枚以上）/ NIfTI / **CSV(TE[ms], Signal)**。CSVは 1列目=TE[ms], 2列目=Signal を数値で。
+- **入力**: DICOM（1枚以上）/ NIfTI / **CSV(TE[ms], Signal)** / **サンプル**。CSVは 1列目=TE[ms], 2列目=Signal を数値で。
 - **単位**: TE/T2Range/SP/MP は **秒**（UIは ms 入力→内部で秒へ変換）。CSVは内部でTE間隔を推定。
 - **PHI注意**: 医療画像は匿名化してアップロードしてください。
 
@@ -477,36 +554,69 @@ colL, colR = st.columns([1, 1])
 
 # ====== 左: 入力・基本パラメータ ======
 with colL:
-    mode_in = st.radio("入力モード", ["DICOM（1枚以上）", "NIfTI（既存）", "CSV（TE[ms],Signal）"], index=0)
+    source = st.radio("入力ソース", ["アップロード", "サンプルを使う"], index=0)
+
+    if source == "アップロード":
+        mode_in = st.radio("入力モード", ["DICOM（1枚以上）", "NIfTI（既存）", "CSV（TE[ms],Signal）"], index=0)
+    else:
+        mode_in = st.radio("サンプル種別", ["CSV（合成データ）", "NIfTI（4x4x1xN 合成）"], index=0)
 
     dicoms = []
     nifti_inputs = []
     csv_inputs = []
     mask_paths = []
+    sample_note = st.empty()
 
-    if mode_in.startswith("DICOM"):
-        dcm_files = st.file_uploader("DICOM（複数可）", type=None, accept_multiple_files=True)
-        validate_uploads(dcm_files)
-        if dcm_files:
-            dicoms = [_save_upload_to_tempfile(f, suffix=f".{f.name.split('.')[-1]}") for f in dcm_files]
-            st.success(f"DICOM一時保存: {len(dicoms)}")
+    if source == "アップロード":
+        if mode_in.startswith("DICOM"):
+            dcm_files = st.file_uploader("DICOM（複数可）", type=None, accept_multiple_files=True)
+            validate_uploads(dcm_files)
+            if dcm_files:
+                dicoms = [_save_upload_to_tempfile(f, suffix=f".{f.name.split('.')[-1]}") for f in dcm_files]
+                st.success(f"DICOM一時保存: {len(dicoms)}")
 
-    elif mode_in.startswith("NIfTI"):
-        files = st.file_uploader("NIfTI（複数可）", type=["nii", "nii.gz"], accept_multiple_files=True)
-        validate_uploads(files)
-        if files:
-            nifti_inputs = [_save_upload_to_tempfile(f, suffix=f".{f.name.split('.')[-1]}") for f in files]
-            st.success(f"NIfTI一時保存: {len(nifti_inputs)}")
+        elif mode_in.startswith("NIfTI"):
+            files = st.file_uploader("NIfTI（複数可）", type=["nii", "nii.gz"], accept_multiple_files=True)
+            validate_uploads(files)
+            if files:
+                nifti_inputs = [_save_upload_to_tempfile(f, suffix=f".{f.name.split('.')[-1]}") for f in files]
+                st.success(f"NIfTI一時保存: {len(nifti_inputs)}")
 
-    else:  # CSV
-        csv_files = st.file_uploader("CSV（複数可）: 1列目=TE[ms], 2列目=Signal", type=["csv", "txt"], accept_multiple_files=True)
-        validate_uploads(csv_files)
-        if csv_files:
-            csv_inputs = [_save_upload_to_tempfile(f, suffix=f".csv") for f in csv_files]
-            st.success(f"CSV一時保存: {len(csv_inputs)}")
+        else:  # CSV
+            csv_files = st.file_uploader("CSV（複数可）: 1列目=TE[ms], 2列目=Signal", type=["csv", "txt"], accept_multiple_files=True)
+            validate_uploads(csv_files)
+            if csv_files:
+                csv_inputs = [_save_upload_to_tempfile(f, suffix=f".csv") for f in csv_files]
+                st.success(f"CSV一時保存: {len(csv_inputs)}")
+    else:
+        st.markdown("**サンプル生成パラメータ（必要に応じて調整）**")
+        nTE = st.number_input("nTE（エコー数）", value=32, min_value=4, max_value=256, step=1)
+        TE0_ms = st.number_input("TE0 [ms]（最初のエコー）", value=10.0, min_value=0.1, step=0.5)
+        dTE_ms = st.number_input("ΔTE [ms]（等間隔）", value=10.0, min_value=0.1, step=0.5)
+        noise = st.number_input("ノイズ標準偏差", value=0.0, min_value=0.0, step=0.1)
 
-    mask_files = None
-    if not mode_in.startswith("CSV"):  # CSVは1ボクセル相当なのでMask不要
+        if mode_in.startswith("CSV"):
+            mode_csv = st.selectbox("CSVモード", ["mono（一成分）", "bi（二成分）"], index=1)
+            m = "mono" if mode_csv.startswith("mono") else "bi"
+            csv_bytes = make_sample_csv(int(nTE), float(TE0_ms), float(dTE_ms), mode=m, noise=float(noise))
+            st.download_button("サンプルCSVをダウンロード", data=csv_bytes, file_name="sample_decay.csv", mime="text/csv")
+            # 内部一時ファイルとしても保存（そのまま解析に使える）
+            fd, fp = mkstemp(suffix=".csv"); os.close(fd)
+            with open(fp, "wb") as f:
+                f.write(csv_bytes)
+            csv_inputs = [Path(fp)]
+            sample_note.info("サンプルCSVを内部にロードしました。右側のパラメータを設定して「解析実行」を押してください。")
+        else:
+            nii_bytes, te_sec = make_sample_nifti(int(nTE), float(TE0_ms), float(dTE_ms), noise=float(noise))
+            st.download_button("サンプルNIfTIをダウンロード", data=nii_bytes, file_name="sample_4d.nii.gz", mime="application/gzip")
+            fd, fp = mkstemp(suffix=".nii.gz"); os.close(fd)
+            with open(fp, "wb") as f:
+                f.write(nii_bytes)
+            nifti_inputs = [Path(fp)]
+            # TEはdTEで既知
+            st.caption(f"サンプルNIfTIのTE間隔 ≈ {dTE_ms:.3f} ms（UIで上書き可）")
+
+    if source == "アップロード" and not mode_in.startswith("CSV"):
         mask_files = st.file_uploader("Mask（任意・NIfTI・未指定または入力と同数）", type=["nii", "nii.gz"], accept_multiple_files=True)
         validate_uploads(mask_files)
         if mask_files:
@@ -517,7 +627,7 @@ with colL:
     do_t2part = st.checkbox("T2part（短/中T2帯解析・MWF等）", value=True)
 
     st.subheader("撮像/推定（ms入力→内部で秒）")
-    te_ms     = st.number_input("TE [ms]（inter-echo spacing。CSV時は推定で上書き）", value=10.0, min_value=0.1, step=0.5)
+    te_ms     = st.number_input("TE [ms]（inter-echo spacing。CSV/サンプルCSV時は推定で上書き）", value=10.0, min_value=0.1, step=0.5)
     nT2       = st.number_input("nT2（T2ビン数）", value=60, min_value=10, max_value=200, step=5)
     t2min_ms  = st.number_input("T2Range 最小 [ms]", value=5.0,  min_value=0.1, step=0.5)
     t2max_ms  = st.number_input("T2Range 最大 [ms]", value=2000.0, min_value=1.0, step=10.0)
@@ -544,7 +654,7 @@ with colR:
 
     with st.expander("T2map/T2part補助", expanded=False):
         matrix_size_txt = st.text_input("MatrixSize（例: 192 192 64）", value="")
-        nTE_val = st.number_input("nTE（echo数；CSV時は自動設定）", value=0, min_value=0, step=1)
+        nTE_val = st.number_input("nTE（echo数；CSV/サンプルCSV時は自動設定）", value=0, min_value=0, step=1)
         threshold = st.number_input("Threshold（1st echo intensity cutoff）", value=0.0, step=0.1)
         chi2factor = st.number_input("Chi2Factor", value=0.0, step=0.1)
         t1_val = st.number_input("T1 [s]", value=0.0, step=0.1)
@@ -571,85 +681,68 @@ with colR:
     slice_index = st.number_input("sliceインデックス", value=0, min_value=0, step=1)
     var_filter_regex = st.text_input("CSV対象 変数名フィルタ（正規表現, 空=全て）", value="")
 
-    TIMEOUT_SEC = st.number_input("解析タイムアウト [秒]", value=3600, min_value=60, step=60)
+    TIMEOUT_SEC = st.number_input("解析タイムアウト [秒]", value=1800, min_value=60, step=60)
 
-    run_btn = st.button("解析実行", type="primary")
+    run_btn = st.button("解析実行（サンプル/アップロード）", type="primary")
     log_area = st.empty()
 
 # ====== 実行 ======
 if run_btn:
     try:
-        # 入力準備
         inputs_for_decaes: List[Path] = []
         te_ms_overwrite: Optional[float] = None
         te_evidence_msgs: List[str] = []
 
-        if mode_in.startswith("DICOM"):
-            if not dicoms:
-                st.error("少なくとも1枚以上のDICOMをアップロードしてください。"); st.stop()
-            st.info("dcm2niix で NIfTI 変換中…")
-            series_list = dcm2niix_convert(dicoms)
+        if source == "アップロード":
+            if mode_in.startswith("DICOM"):
+                if not dicoms:
+                    st.error("少なくとも1枚以上のDICOMをアップロードしてください。"); st.stop()
+                st.info("dcm2niix で NIfTI 変換中…")
+                series_list = dcm2niix_convert(dicoms)
+                all_desc = [s["series_desc"] for s in series_list]
+                picked = st.multiselect("解析するシリーズを選択（未選択=全選択）", all_desc, default=all_desc)
+                selected = [s for s in series_list if (s["series_desc"] in picked or not picked)]
+                for s in selected:
+                    inputs_for_decaes.append(s["nifti"])
+                    if te_ms_overwrite is None and s["json"] and s["json"].exists():
+                        te_s, info = parse_te_from_json_verbose(s["json"])
+                        if te_s and te_s > 0:
+                            te_ms_overwrite = te_s * 1000.0
+                if te_ms_overwrite is not None:
+                    te_ms = float(te_ms_overwrite)
 
-            # シリーズ選択UI
-            all_desc = [s["series_desc"] for s in series_list]
-            picked = st.multiselect("解析するシリーズを選択（未選択=全選択）", all_desc, default=all_desc)
-            selected = [s for s in series_list if (s["series_desc"] in picked or not picked)]
+            elif mode_in.startswith("NIfTI"):
+                if not nifti_inputs:
+                    st.error("NIfTIを1つ以上アップロードしてください。"); st.stop()
+                inputs_for_decaes = nifti_inputs
 
-            for s in selected:
-                inputs_for_decaes.append(s["nifti"])
-                if te_ms_overwrite is None and s["json"] and s["json"].exists():
-                    te_s, info = parse_te_from_json_verbose(s["json"])
-                    if info["candidates"]:
-                        ets_ms = [x * 1000.0 for x in info["candidates"]]
-                        diffs_ms = [x * 1000.0 for x in info["diffs"]]
-                        med_ms = info["median_diff"] * 1000.0 if info["median_diff"] else None
-                        te_evidence_msgs.append(
-                            f"[{s['series_desc']}] EchoTimes(ms)候補={np.round(ets_ms,3).tolist()} "
-                            f"→ Δ(ms)={np.round(diffs_ms,3).tolist()} → 中央値≈ {med_ms:.3f} ms" if med_ms else
-                            f"[{s['series_desc']}] EchoTimes(ms)候補={np.round(ets_ms,3).tolist()}（Δ推定不可）"
-                        )
-                    if te_s and te_s > 0:
-                        te_ms_overwrite = te_s * 1000.0
-
-            st.success(f"NIfTI変換: {len(inputs_for_decaes)}")
-            if te_ms_overwrite is not None:
-                st.info(f"DICOMから推定されたTE候補 ≈ {te_ms_overwrite:.3f} ms（必要に応じて修正可）")
-                for m in te_evidence_msgs:
-                    st.caption(m)
-                te_ms = float(te_ms_overwrite)
-
-        elif mode_in.startswith("NIfTI"):
-            if not nifti_inputs:
-                st.error("NIfTIを1つ以上アップロードしてください。"); st.stop()
-            inputs_for_decaes = nifti_inputs
-
-        else:  # CSV
-            if not csv_inputs:
-                st.error("CSVを1つ以上アップロードしてください。"); st.stop()
-            st.info("CSV を 4D NIfTI（1x1x1xN）へ変換中…")
-            csv_infos = []
-            for i, p in enumerate(csv_inputs):
-                nii_path, te_sec_est, info = csv_to_nifti(p)
+            else:  # CSV
+                if not csv_inputs:
+                    st.error("CSVを1つ以上アップロードしてください。"); st.stop()
+                st.info("CSV を 4D NIfTI（1x1x1xN）へ変換中…")
+                nii_path, te_sec_est, info = csv_to_nifti(csv_inputs[0])
                 inputs_for_decaes.append(nii_path)
-                csv_infos.append((p.name, te_sec_est, info))
-            # TE推定（CSV由来）：最初のCSVでUI上書き
-            first_name, te_sec_est, info = csv_infos[0]
-            if te_sec_est and te_sec_est > 0:
-                te_ms_overwrite = te_sec_est * 1000.0
-                te_ms = float(te_ms_overwrite)
-                # 誤差表示
-                st.info(f"CSVから推定されたTE間隔 ≈ {te_ms:.3f} ms（{first_name}）")
-                st.caption(
-                    f"nTE={info['nTE']}, ΔTE中央値={info['interval_ms_median']:.6f} ms, "
-                    f"最大偏差={info['interval_ms_max_err']:.6f} ms（非等間隔CSVは近似扱い）"
-                )
-            # nTEはCSVの行数に合わせる（UIのnTE入力とは独立）
-            nTE_val = info["nTE"]
+                if te_sec_est and te_sec_est > 0:
+                    te_ms = float(te_sec_est * 1000.0)
+                nTE_val = info["nTE"]
+        else:
+            # サンプル
+            if mode_in.startswith("CSV"):
+                st.info("サンプルCSV を 4D NIfTI（1x1x1xN）へ変換中…")
+                nii_path, te_sec_est, info = csv_to_nifti(csv_inputs[0])
+                inputs_for_decaes.append(nii_path)
+                if te_sec_est and te_sec_est > 0:
+                    te_ms = float(te_sec_est * 1000.0)
+                nTE_val = info["nTE"]
+            else:
+                # サンプルNIfTI（dTEは既知だがUI優先）
+                inputs_for_decaes = nifti_inputs
 
-        if mask_paths and len(mask_paths) not in (0, len(inputs_for_decaes)):
-            st.error("Maskは未指定か、入力と同数で指定してください。"); st.stop()
+        if source == "アップロード" and not mode_in.startswith("CSV"):
+            if mask_paths and len(mask_paths) not in (0, len(inputs_for_decaes)):
+                st.error("Maskは未指定か、入力と同数で指定してください。"); st.stop()
 
-        # 単位変換 ms→s（0は未指定扱いに）
+        # 単位変換
         def to_s_optional(ms: float) -> Optional[float]:
             return None if (ms is None or float(ms) == 0.0) else float(ms)/1000.0
         te_sec    = to_s_optional(te_ms)
@@ -657,18 +750,17 @@ if run_btn:
         spmin_sec = to_s_optional(spmin_ms); spmax_sec = to_s_optional(spmax_ms)
         mpmin_sec = to_s_optional(mpmin_ms); mpmax_sec = to_s_optional(mpmax_ms)
 
-        # nTE の扱い：CSVモードでは前段で自動設定済み。それ以外はUI値。
-        if not mode_in.startswith("CSV"):
-            nTE_val = int(nTE_val) if 'nTE_val' in locals() and nTE_val > 0 else (None if 'nTE_val' not in locals() else None)
+        if 'nTE_val' in locals() and nTE_val and nTE_val > 0:
+            nte_cli = int(nTE_val)
+        else:
+            nte_cli = None
 
         nT2_val = int(nT2) if nT2 > 0 else None
 
-        # RegParams
         reg_params: List[float] = []
         if reg.lower() in ("chi2","mdp") and reg_params_txt.strip():
             reg_params = [float(x) for x in reg_params_txt.split()]
 
-        # MatrixSize
         matrix_size = None
         if 'matrix_size_txt' in locals() and matrix_size_txt.strip():
             try:
@@ -677,12 +769,10 @@ if run_btn:
             except Exception:
                 matrix_size = None
 
-        # B1map
         b1maps: List[Path] = []
         if 'b1_files' in locals() and b1_files:
             b1maps = [_save_upload_to_tempfile(f, suffix=f".{f.name.split('.')[-1]}") for f in b1_files]
 
-        # 数値オプション（0→未指定）
         def none_if_zero(x: float) -> Optional[float]:
             return None if (x is None or float(x) == 0.0) else float(x)
         threshold_opt   = none_if_zero(threshold)
@@ -695,13 +785,11 @@ if run_btn:
         nRefAngles_opt  = int(nRefAngles) if nRefAngles > 0 else None
         nRefAnglesMin_opt = int(nRefAnglesMin) if nRefAnglesMin > 0 else None
 
-        # 追加引数（サニタイズ）
         extra_args = parse_cli_extra(extra_txt)
         betargs = parse_cli_extra(betargs_txt)
 
         with TemporaryDirectory(prefix="decaes_out_") as td:
             out_dir = Path(td)
-            # 引数構築
             args = build_decaes_args(
                 inputs=inputs_for_decaes, masks=mask_paths, out_dir=out_dir,
                 do_t2map=bool(do_t2map), do_t2part=bool(do_t2part),
@@ -710,7 +798,7 @@ if run_btn:
                 spmin_sec=spmin_sec, spmax_sec=spmax_sec,
                 mpmin_sec=mpmin_sec, mpmax_sec=mpmax_sec,
                 reg=str(reg), reg_params=reg_params,
-                matrix_size=matrix_size, nTE=int(nTE_val) if 'nTE_val' in locals() and nTE_val else None,
+                matrix_size=matrix_size, nTE=nte_cli,
                 threshold=threshold_opt, chi2factor=chi2factor_opt, t1=t1_opt, sigmoid=sigmoid_opt,
                 b1maps=b1maps, nRefAngles=nRefAngles_opt, nRefAnglesMin=nRefAnglesMin_opt,
                 minRefAngle=minRefAngle_opt, setFlipAngle=setFlipAngle_opt, refConAngle=refConAngle_opt,
@@ -742,7 +830,6 @@ if run_btn:
             else:
                 _ = convert_mat_dir_to_csv_gz(out_dir, csv_dir, mode="summary", var_regex=var_pattern)
 
-            # 総合ZIP（.mat + CSV.gz + ログ）
             final_bio = io.BytesIO()
             with zipfile.ZipFile(final_bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 for p in out_dir.rglob("*"):
